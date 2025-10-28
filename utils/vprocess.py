@@ -560,9 +560,11 @@ def process_vision_info(
         video_inputs = None
 
     video_kwargs = {'do_sample_frames': False}
+
     if not return_video_metadata: # BC for qwen2.5vl
         video_kwargs.update({'fps': video_sample_fps_list})
 
     if return_video_kwargs:
         return image_inputs, video_inputs, video_kwargs
+    
     return image_inputs, video_inputs

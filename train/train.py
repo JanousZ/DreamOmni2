@@ -3,12 +3,17 @@ import torch.distributed as dist
 from torch.optim import AdamW
 from accelerate import Accelerator
 from peft import get_peft_model, LoraConfig
-from my_fsdp_utils import make_model_fsdp, save_fsdp_lora, save_fsdp_optimizer
 import torch.distributed.fsdp
 import torch.distributed.fsdp.api
 from transformers import Qwen2_5_VLForConditionalGeneration, AutoTokenizer, AutoProcessor
 import argparse
 from dreamomni2.pipeline_dreamomni2 import DreamOmni2Pipeline
+from utils.vprocess import process_vision_info
+import numpy as np
+from my_datasets.replace5k import Replace5kDataset
+from torch.utils.data import DataLoader
+from accelerate.utils import FullyShardedDataParallelPlugin
+from torch.distributed.fsdp import ShardingStrategy
 
 def parse_args():
     """Parses command-line arguments for model paths and server configuration."""
@@ -31,72 +36,248 @@ def parse_args():
         default="/home/yanzhang/models/FLUX.1-Kontext-dev", 
         help="Path to the FLUX.1-Kontext editing."
     )
-    parser.add_argument(
-        "--lora_rank",
-        type=int,
-        default=32
-    )
-    parser.add_argument(
-        "--lora_alpha",
-        type=float,
-        default=32
-    )
-    
+    parser.add_argument("--lora_rank", type=int, default=32)
+    parser.add_argument("--lora_alpha", type=float, default=32)
+    parser.add_argument("--num_epochs", type=int, default=1000)
+    parser.add_argument("--save_dir", type=str, default="./lora_ckpt")
+    parser.add_argument("--save_steps", type=int, default=500)
+    parser.add_argument("--lr", type=float, default=1e-4)
     args = parser.parse_args()
     return args
 
-# 1️⃣ 初始化分布式环境
-accelerator = Accelerator()
-device = accelerator.device
+def infer_vlm(input_img_path, input_instruction, prefix):
+    tp=[]
+    for path in input_img_path:
+        tp.append({"type": "image", "image": path})
+    tp.append({"type": "text", "text": input_instruction+prefix})
+    messages = [
+            {
+                "role": "user",
+                "content": tp,
+            }
+        ]
 
-# 2️⃣ 加载预训练模型
+    # Preparation for inference
+    text = processor.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+
+    image_inputs, video_inputs = process_vision_info(messages)
+    inputs = processor(
+        text=[text],
+        images=image_inputs,
+        videos=video_inputs,
+        padding=True,
+        return_tensors="pt",
+    )
+    inputs = inputs.to(device)
+
+    # Inference
+    generated_ids = vlm_model.generate(**inputs, do_sample=False, max_new_tokens=4096)
+    generated_ids_trimmed = [
+        out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+    ]
+    output_text = processor.batch_decode(
+        generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+    )
+    return output_text[0]
+
+def extract_gen_content(text):
+    text = text[6:-7]
+    
+    return text
+
+# 初始化分布式环境 & 日志
+
+fsdp_plugin = FullyShardedDataParallelPlugin(
+    sharding_strategy=ShardingStrategy.HYBRID_SHARD,
+    limit_all_gathers=True,
+    cpu_offload=False
+)
+
+accelerator = Accelerator(
+    mixed_precision="bf16",
+    fsdp_plugin=fsdp_plugin,
+    log_with="tensorboard",
+)
+
+device = accelerator.device
+writer = accelerator.get_tracker("tensorboard", unwrap=True)
+
+# 加载预训练模型
 ARGS = parse_args()
 vlm_path = ARGS.vlm_path
 base_model = ARGS.base_model_path
 vlm_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-    vlm_path, torch_dtype="bfloat16", device_map="auto"
+    vlm_path, torch_dtype="bfloat16", device_map="cpu"
 )
+vlm_model.eval()
+vlm_model.to(device)
+for name, param in vlm_model.named_parameters():
+    param.requires_grad = False
 processor = AutoProcessor.from_pretrained(vlm_path)
-pipe = DreamOmni2Pipeline.from_pretrained(base_model, torch_dtype=torch.bfloat16, device_map="balanced")
+pipe = DreamOmni2Pipeline.from_pretrained(base_model, torch_dtype=torch.bfloat16)
+pipe.vae.eval()
+pipe.transformer.train()
+pipe.text_encoder_2.eval()
+pipe.text_encoder.eval()
+pipe.to(device)
+for name, param in pipe.named_parameters():
+    param.requires_grad = False
 
-# 3️⃣ 注入 LoRA 层
+# 注入 LoRA 层
 lora_rank = ARGS.lora_rank
 lora_alpha = ARGS.lora_alpha
 lora_config = LoraConfig(
-    r=lora_rank, lora_alpha=lora_alpha, target_modules=["q_proj", "v_proj"], lora_dropout=0.05
+    r=lora_rank, lora_alpha=lora_alpha, target_modules=["q_proj", "k_proj", "v_proj", "out"], lora_dropout=0.05
 )
-pipe.add_adapter(lora_config)
+pipe.add_adapter(lora_config, name="edit")
 
-model = get_peft_model(pipe, lora_config)
+# 检查可训练参数
+trainable_params = [p for n, p in pipe.named_parameters() if p.requires_grad]
+trainable_named_params = [n for n, p in pipe.named_parameters() if p.requires_grad]
+print(trainable_named_params)
 
-# 4️⃣ 包裹为 FSDP 模型
-fsdp_model = make_model_fsdp(
-    model,
-    param_dtype=torch.float16,
-    device=device,
-    sharding_strategy=torch.distributed.fsdp.api.ShardingStrategy.HYBRID_SHARD,
-    part_size=1e7,
-    use_orig_params=False
+# 设置优化器
+lr = ARGS.lr
+optimizer = AdamW(trainable_params, lr=lr)
+
+# 加载数据 
+dataset = Replace5kDataset(json_file="/home/yanzhang/datasets/replace-5k/train.json")
+dataloader = DataLoader(dataset, batch_size=4, shuffle=True)
+
+vlm_model, pipe, optimizer, dataloader = accelerator.prepare(
+    vlm_model, pipe, optimizer, dataloader
 )
 
-# 5️⃣ 设置优化器
-optimizer = AdamW(fsdp_model.parameters(), lr=1e-4)
-
-# 6️⃣ 加载数据 & 训练循环
+# 训练循环
+num_epochs = ARGS.num_epochs
+global_step = 0
+save_steps = ARGS.save_steps
 for epoch in range(num_epochs):
     for batch in dataloader:
-        with accelerator.accumulate(fsdp_model):
-            outputs = fsdp_model(**batch)
-            loss = outputs.loss
+        with accelerator.accumulate(pipe):
+            with torch.no_grad():
+                # 获取vlm prompt
+                instructions = batch["prompt"]
+                src_image_paths = batch["src_image_path"]
+                ref_image_paths = batch["ref_image_path"]
+                tgt_image_paths = batch["tgt_image_path"]
+                src_images = batch["src_image"]
+                ref_images = batch["ref_image"]
+                tgt_images = batch["tgt_image"]
+                prefix = " It is editing task."
+                prompts = infer_vlm(src_image_paths, instructions, prefix)
+                prompts = extract_gen_content(prompts)
+            
+                # prompt encode
+                (
+                    prompt_embeds,
+                    pooled_prompt_embeds,
+                    text_ids,
+                ) = pipe.encode_prompt(
+                    prompt=prompts,
+                    prompt_2=None,
+                    prompt_embeds=None,
+                    pooled_prompt_embeds=None,
+                    device=device,
+                    num_images_per_prompt=1,
+                    max_sequence_length=512,
+                    lora_scale=None,
+                )
+    
+                # image preprocess
+                # replace5k dataset has been preprocess during getitem
+                
+                # image encode
+                height = 1024
+                width = 1024
+                batch_size = src_images.shape[0]
+                num_channels_latents = pipe.transformer.config.in_channels // 4
+                src_image_latents = pipe._encode_vae_image(image = src_images)
+                ref_image_latents = pipe._encode_vae_image(image = ref_images)
+                tgt_image_latents = pipe._encode_vae_image(image = tgt_images)
+                image_latent_height, image_latent_width = src_image_latents.shape[2:]
+                src_image_latents = pipe._pack_latents(
+                    src_image_latents, batch_size, num_channels_latents, image_latent_height, image_latent_width
+                )
+                ref_image_latents = pipe._pack_latents(
+                    ref_image_latents, batch_size, num_channels_latents, image_latent_height, image_latent_width
+                )
+                tgt_image_latents = pipe._pack_latents(
+                    tgt_image_latents, batch_size, num_channels_latents, image_latent_height, image_latent_width
+                )
+                src_image_ids = pipe._prepare_latent_image_ids(
+                    batch_size, image_latent_height // 2, image_latent_width // 2, device, prompt_embeds.dtype
+                )
+                ref_image_ids = pipe._prepare_latent_image_ids(
+                    batch_size, image_latent_height // 2, image_latent_width // 2, device, prompt_embeds.dtype
+                )
+                tgt_image_ids = pipe._prepare_latent_image_ids(
+                    batch_size, image_latent_height // 2, image_latent_width // 2, device, prompt_embeds.dtype
+                )
+                w_offset = image_latent_width // 2
+                src_image_ids[..., 0] += 1
+                src_image_ids[..., 2] += w_offset
+                w_offset += image_latent_width // 2
+                ref_image_ids[..., 0] += 2
+                ref_image_ids[..., 2] += w_offset
+                
+                # timestep
+                t = torch.rand(batch_size, 1, 1, 1, device=device) 
+
+                # sample & add_noise
+                x_1 = torch.randn_like(tgt_image_latents)
+                x_t = (1 - t) * tgt_image_latents + t * x_1
+
+            # denoise
+            latent_model_input = torch.cat([x_t, src_image_latents, ref_image_latents], dim=1)
+            latent_ids = torch.cat([tgt_image_ids, src_image_ids, ref_image_ids], dim=1)
+            noise_pred = pipe.transformer(
+                    hidden_states=latent_model_input,
+                    timestep=t,
+                    guidance=None,
+                    pooled_projections=pooled_prompt_embeds,
+                    encoder_hidden_states=prompt_embeds,
+                    txt_ids=text_ids,
+                    img_ids=latent_ids,
+                    return_dict=False,
+                )[0]
+            noise_pred = noise_pred[:, : x_t.size(1)]
+
+            # loss
+            diff_loss = torch.nn.functional.mse_loss(noise_pred, x_1 - tgt_image_latents)
+            pred_x0 = x_t - t * noise_pred
+            lambda_dino = 0
+            dino_loss = 0
+            loss = diff_loss + lambda_dino * dino_loss
+
             accelerator.backward(loss)
             optimizer.step()
             optimizer.zero_grad()
-    accelerator.print(f"Epoch {epoch}: loss={loss.item()}")
 
-# 7️⃣ 保存 LoRA 权重（仅主进程）
-save_dir = "./lora_ckpt"
-save_fsdp_lora(fsdp_model, save_dir, is_main_process=accelerator.is_main_process)
+        global_step += 1
 
-# 8️⃣ （可选）保存优化器状态
+        if accelerator.is_main_process:
+            writer.add_scalar("train/loss", loss.item(), global_step)
+            writer.add_scalar("train/diff_loss", diff_loss.item(), global_step)
+            writer.add_scalar("train/dino_loss", dino_loss.item(), global_step)
+
+        # 仅主进程打印日志
+        if accelerator.is_main_process and global_step % 10 == 0:
+            accelerator.print(f"Epoch {epoch}, Step {global_step}: loss={loss.item():.4f}")
+
+        # 每 save_steps 步保存一次 LoRA
+        if accelerator.is_main_process and global_step % save_steps == 0:
+            save_dir = f"./lora_ckpt/step_{global_step}"
+            save_fsdp_lora(pipe, save_dir, is_main_process=True)
+            accelerator.print(f"💾 Saved LoRA checkpoint at step {global_step} -> {save_dir}")
+
+# 训练完成后保存最终模型
 if accelerator.is_main_process:
-    save_fsdp_optimizer({"model": fsdp_model}, optimizer, save_dir)
+    final_dir = "./lora_ckpt/final"
+    save_fsdp_lora(pipe, final_dir, is_main_process=True)
+    accelerator.print(f"✅ Final LoRA weights saved to {final_dir}")
+
+if accelerator.is_main_process:
+    writer.close()

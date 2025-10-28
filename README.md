@@ -74,7 +74,7 @@ pip install -r requirements.txt
 Next, download the DreamOmni2 weights into the models folder.
 
 ```bash
-huggingface-cli download --resume-download --local-dir-use-symlinks False xiabs/DreamOmni2 --local-dir ./models
+huggingface-cli download --resume-download --local-dir-use-symlinks False xiabs/DreamOmni2 --local-dir ./models/dreamomni2
 ```
 
 ### Inference
@@ -84,10 +84,10 @@ Multimodal Instriction-based Editing
 **Notably, for editing tasks, due to the format settings of the training data, we need to place the image to be edited in the first position.**
 
 ```bash
-python3 /mnt/bn/unifygen/xiabin_dev/iclr2026/DreamOmni2/inference_edit.py \
-    --input_img_path "example_input/edit_tests/src.jpg" "example_input/edit_tests/ref.jpg" \
-    --input_instruction "Make the woman from the second image stand on the road in the first image." \
-    --output_path "example_input/edit_tests/edit_res.png"
+python3 /home/yanzhang/DreamOmni2/inference_edit.py \
+    --input_img_path "./example_input/edit_tests/12/src.jpg" "./example_input/edit_tests/12/ref.jpg" \
+    --input_instruction "Make the first image has the same style as the second image" \
+    --output_path "./example_input/edit_tests/12/edit_res.png"
 ```
 
 Multimodal Instriction-based Generation

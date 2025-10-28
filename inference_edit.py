@@ -56,19 +56,19 @@ def parse_args():
     parser.add_argument(
         "--vlm_path", 
         type=str, 
-        default="./models/vlm-model", 
+        default="/home/yanzhang/models/DreamOmni2/vlm-model", 
         help="Path to the VLM model directory."
     )
     parser.add_argument(
         "--edit_lora_path", 
         type=str, 
-        default="./models/edit_lora", 
+        default="/home/yanzhang/models/DreamOmni2/edit_lora", 
         help="Path to the FLUX.1-Kontext editing LoRA weights directory."
     )
     parser.add_argument(
         "--base_model_path", 
         type=str, 
-        default="black-forest-labs/FLUX.1-Kontext-dev", 
+        default="/home/yanzhang/models/FLUX.1-Kontext-dev", 
         help="Path to the FLUX.1-Kontext editing."
     )
     parser.add_argument(
@@ -100,8 +100,8 @@ ARGS = parse_args()
 vlm_path = ARGS.vlm_path
 edit_lora_path = ARGS.edit_lora_path
 base_model = ARGS.base_model_path
-pipe = DreamOmni2Pipeline.from_pretrained(base_model, torch_dtype=torch.bfloat16)
-pipe.to(device)
+pipe = DreamOmni2Pipeline.from_pretrained(base_model, torch_dtype=torch.bfloat16, device_map="balanced")
+# pipe.to(device)
 
 pipe.load_lora_weights(
     edit_lora_path,
@@ -111,7 +111,7 @@ pipe.set_adapters(["edit"], adapter_weights=[1])
 
 
 vlm_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-    vlm_path, torch_dtype="bfloat16", device_map="cuda"
+    vlm_path, torch_dtype="bfloat16", device_map="auto"
 )
 processor = AutoProcessor.from_pretrained(vlm_path)
 
@@ -157,7 +157,7 @@ def infer(source_imgs,prompt):
     height=source_imgs[0].height,
     width=source_imgs[0].width,
     prompt=prompt,
-    num_inference_steps=30,
+    num_inference_steps=8,
     guidance_scale=3.5,
     ).images[0]
     return image

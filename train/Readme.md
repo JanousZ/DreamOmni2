@@ -1,0 +1,1 @@
+accelerate launch --config_file train/fsdp.yaml -m train.train

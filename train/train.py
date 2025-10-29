@@ -14,6 +14,8 @@ from my_datasets.replace5k import Replace5kDataset
 from torch.utils.data import DataLoader
 from accelerate.utils import FullyShardedDataParallelPlugin
 from torch.distributed.fsdp import ShardingStrategy
+import os
+from accelerate.utils import gather_object
 
 def parse_args():
     """Parses command-line arguments for model paths and server configuration."""
@@ -45,42 +47,43 @@ def parse_args():
     args = parser.parse_args()
     return args
 
-def infer_vlm(input_img_path, input_instruction, prefix):
-    tp=[]
-    for path in input_img_path:
-        tp.append({"type": "image", "image": path})
-    tp.append({"type": "text", "text": input_instruction+prefix})
-    messages = [
-            {
-                "role": "user",
-                "content": tp,
-            }
+def infer_vlm_batch(input_img_paths_batch, input_instructions_batch, prefix):
+    outputs = []
+    for input_img_path, input_instruction in zip(input_img_paths_batch, input_instructions_batch):
+        print(f"local_rank:{local_rank}--------------------------")
+        tp = []
+        for path in input_img_path:
+            tp.append({"type": "image", "image": path})
+        # 如果 input_instruction 是 list，需要 join
+        if isinstance(input_instruction, list):
+            instruction_str = " ".join(input_instruction)
+        else:
+            instruction_str = str(input_instruction)
+        tp.append({"type": "text", "text": instruction_str + prefix})
+
+        messages = [{"role": "user", "content": tp}]
+        text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        image_inputs, video_inputs = process_vision_info(messages)
+        inputs = processor(
+            text=[text],
+            images=image_inputs,
+            videos=video_inputs,
+            padding=True,
+            return_tensors="pt",
+        )
+
+        inputs = inputs.to(device)
+
+        generated_ids = vlm_model.generate(**inputs, do_sample=False, max_new_tokens=4096)
+        generated_ids_trimmed = [
+            out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
         ]
+        output_text = processor.batch_decode(
+            generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+        )
+        outputs.append(output_text[0])
 
-    # Preparation for inference
-    text = processor.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
-    )
-
-    image_inputs, video_inputs = process_vision_info(messages)
-    inputs = processor(
-        text=[text],
-        images=image_inputs,
-        videos=video_inputs,
-        padding=True,
-        return_tensors="pt",
-    )
-    inputs = inputs.to(device)
-
-    # Inference
-    generated_ids = vlm_model.generate(**inputs, do_sample=False, max_new_tokens=4096)
-    generated_ids_trimmed = [
-        out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-    ]
-    output_text = processor.batch_decode(
-        generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
-    )
-    return output_text[0]
+    return outputs
 
 def extract_gen_content(text):
     text = text[6:-7]
@@ -88,55 +91,45 @@ def extract_gen_content(text):
     return text
 
 # 初始化分布式环境 & 日志
+accelerator = Accelerator(log_with="tensorboard")
 
-fsdp_plugin = FullyShardedDataParallelPlugin(
-    sharding_strategy=ShardingStrategy.HYBRID_SHARD,
-    limit_all_gathers=True,
-    cpu_offload=False
-)
-
-accelerator = Accelerator(
-    mixed_precision="bf16",
-    fsdp_plugin=fsdp_plugin,
-    log_with="tensorboard",
-)
-
-device = accelerator.device
+# device = accelerator.device
+local_rank = int(os.environ["LOCAL_RANK"])
+device = torch.device(f"cuda:{local_rank}")
 writer = accelerator.get_tracker("tensorboard", unwrap=True)
 
 # 加载预训练模型
 ARGS = parse_args()
 vlm_path = ARGS.vlm_path
 base_model = ARGS.base_model_path
-vlm_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-    vlm_path, torch_dtype="bfloat16", device_map="cpu"
-)
-vlm_model.eval()
-vlm_model.to(device)
+# vlm_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+#     vlm_path, torch_dtype="bfloat16"
+# )
+# vlm_model.eval()
+# vlm_model.to(device)
+
 for name, param in vlm_model.named_parameters():
     param.requires_grad = False
 processor = AutoProcessor.from_pretrained(vlm_path)
-pipe = DreamOmni2Pipeline.from_pretrained(base_model, torch_dtype=torch.bfloat16)
+
+pipe = DreamOmni2Pipeline.from_pretrained(base_model, torch_dtype=torch.bfloat16, device_map="balanced")
 pipe.vae.eval()
 pipe.transformer.train()
 pipe.text_encoder_2.eval()
 pipe.text_encoder.eval()
-pipe.to(device)
-for name, param in pipe.named_parameters():
-    param.requires_grad = False
 
 # 注入 LoRA 层
 lora_rank = ARGS.lora_rank
 lora_alpha = ARGS.lora_alpha
 lora_config = LoraConfig(
-    r=lora_rank, lora_alpha=lora_alpha, target_modules=["q_proj", "k_proj", "v_proj", "out"], lora_dropout=0.05
+    r=lora_rank, lora_alpha=lora_alpha, target_modules=["to_q", "to_v"], lora_dropout=0.05
 )
-pipe.add_adapter(lora_config, name="edit")
+pipe.transformer.add_adapter(lora_config, adapter_name="edit")
 
 # 检查可训练参数
-trainable_params = [p for n, p in pipe.named_parameters() if p.requires_grad]
-trainable_named_params = [n for n, p in pipe.named_parameters() if p.requires_grad]
-print(trainable_named_params)
+trainable_params = [p for n, p in pipe.transformer.named_parameters() if p.requires_grad]
+trainable_named_params = [n for n, p in pipe.transformer.named_parameters() if p.requires_grad]
+# print(trainable_named_params)
 
 # 设置优化器
 lr = ARGS.lr
@@ -145,11 +138,10 @@ optimizer = AdamW(trainable_params, lr=lr)
 # 加载数据 
 dataset = Replace5kDataset(json_file="/home/yanzhang/datasets/replace-5k/train.json")
 dataloader = DataLoader(dataset, batch_size=4, shuffle=True)
-
-vlm_model, pipe, optimizer, dataloader = accelerator.prepare(
-    vlm_model, pipe, optimizer, dataloader
+pipe, optimizer, dataloader = accelerator.prepare(
+    pipe, optimizer, dataloader
 )
-
+generator = torch.Generator(device=device).manual_seed(42)
 # 训练循环
 num_epochs = ARGS.num_epochs
 global_step = 0
@@ -166,9 +158,12 @@ for epoch in range(num_epochs):
                 src_images = batch["src_image"]
                 ref_images = batch["ref_image"]
                 tgt_images = batch["tgt_image"]
+                batch_size = src_images.shape[0]
                 prefix = " It is editing task."
-                prompts = infer_vlm(src_image_paths, instructions, prefix)
-                prompts = extract_gen_content(prompts)
+
+                # prompts = infer_vlm_batch([[a,b] for a,b in zip(src_image_paths, ref_image_paths)], instructions, prefix)
+                # prompts = [extract_gen_content(prompt) for prompt in prompts]
+                prompts = instructions
             
                 # prompt encode
                 (
@@ -192,11 +187,10 @@ for epoch in range(num_epochs):
                 # image encode
                 height = 1024
                 width = 1024
-                batch_size = src_images.shape[0]
                 num_channels_latents = pipe.transformer.config.in_channels // 4
-                src_image_latents = pipe._encode_vae_image(image = src_images)
-                ref_image_latents = pipe._encode_vae_image(image = ref_images)
-                tgt_image_latents = pipe._encode_vae_image(image = tgt_images)
+                src_image_latents = pipe._encode_vae_image(image = src_images, generator = generator)
+                ref_image_latents = pipe._encode_vae_image(image = ref_images, generator = generator)
+                tgt_image_latents = pipe._encode_vae_image(image = tgt_images, generator = generator)
                 image_latent_height, image_latent_width = src_image_latents.shape[2:]
                 src_image_latents = pipe._pack_latents(
                     src_image_latents, batch_size, num_channels_latents, image_latent_height, image_latent_width

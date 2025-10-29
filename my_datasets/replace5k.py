@@ -22,6 +22,7 @@ class Replace5kDataset(Dataset):
     
     def preprocess(self, img):
         # img: numpy, [H, W, C], uint8
+        img = np.array(img)
         img = img.astype(np.float32) / 127.5 - 1.0  # -> [-1,1]
         img = torch.from_numpy(img).permute(2, 0, 1)  # -> [C,H,W]
         return img
@@ -45,7 +46,7 @@ class Replace5kDataset(Dataset):
             ref_image = Image.open(ref_image_path).convert("RGB")
             src_image = Image.open(src_image_path).convert("RGB")
         
-        instruction = None
+        instruction = "Replace the object in the first image with the object from the second image."
 
         if self.is_image_preprocess:
             gt_image = self.preprocess(gt_image)

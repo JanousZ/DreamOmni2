@@ -29,6 +29,7 @@ class Replace5kDataset(Dataset):
 
     def get_sample(self, idx):
         image_dir = self.image_dirs[idx]
+        image_dir = image_dir.replace("/home/yanzhang", "/home/yanzhang/241", 1)
         ref_image_path = os.path.join(image_dir,'reference_image.png')
         src_image_path = os.path.join(image_dir,'raw_image.png')
         gt_image_path = os.path.join(image_dir,'ground_truth.png')

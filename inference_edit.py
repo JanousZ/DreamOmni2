@@ -111,7 +111,7 @@ pipe.set_adapters(["edit"], adapter_weights=[1])
 
 
 vlm_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-    vlm_path, torch_dtype="bfloat16", device_map="auto"
+    vlm_path, torch_dtype="bfloat16", device_map="cuda"
 )
 processor = AutoProcessor.from_pretrained(vlm_path)
 
@@ -157,7 +157,7 @@ def infer(source_imgs,prompt):
     height=source_imgs[0].height,
     width=source_imgs[0].width,
     prompt=prompt,
-    num_inference_steps=8,
+    num_inference_steps=30,
     guidance_scale=3.5,
     ).images[0]
     return image
@@ -175,6 +175,11 @@ for path in input_img_path:
 
 prompt=infer_vlm(input_img_path,input_instruction,prefix)
 prompt = extract_gen_content(prompt)
-image=infer(source_imgs,prompt)
+
+image=infer(source_imgs, prompt)
 output_path = ARGS.output_path
+image.save(output_path)
+
+image=infer(source_imgs, input_instruction)
+output_path = ARGS.output_path[:-4] + "_1.jpg"
 image.save(output_path)

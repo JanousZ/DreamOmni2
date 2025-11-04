@@ -29,7 +29,7 @@ class Replace5kDataset(Dataset):
 
     def get_sample(self, idx):
         image_dir = self.image_dirs[idx]
-        image_dir = image_dir.replace("/home/yanzhang", "/home/yanzhang/241", 1)
+        #image_dir = image_dir.replace("/home/yanzhang", "/home/yanzhang/241", 1)
         ref_image_path = os.path.join(image_dir,'reference_image.png')
         src_image_path = os.path.join(image_dir,'raw_image.png')
         gt_image_path = os.path.join(image_dir,'ground_truth.png')
@@ -43,9 +43,9 @@ class Replace5kDataset(Dataset):
             src_image = cv2.cvtColor(src_image, cv2.COLOR_BGR2RGB)
         
         if self.read_mode == "PIL":
-            gt_image = Image.open(gt_image_path).convert("RGB")
-            ref_image = Image.open(ref_image_path).convert("RGB")
-            src_image = Image.open(src_image_path).convert("RGB")
+            gt_image = Image.open(gt_image_path).resize((512,512)).convert("RGB")
+            ref_image = Image.open(ref_image_path).resize((512,512)).convert("RGB")
+            src_image = Image.open(src_image_path).resize((512,512)).convert("RGB")
         
         instruction = "Replace the object in the first image with the object from the second image."
 

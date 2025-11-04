@@ -85,9 +85,9 @@ Multimodal Instriction-based Editing
 
 ```bash
 python3 /home/yanzhang/DreamOmni2/inference_edit.py \
-    --input_img_path "./example_input/edit_tests/12/src.jpg" "./example_input/edit_tests/12/ref.jpg" \
-    --input_instruction "Make the first image has the same style as the second image" \
-    --output_path "./example_input/edit_tests/12/edit_res.png"
+    --input_img_path "./example_input/edit_tests/1/ref_0.jpg" "./example_input/edit_tests/1/ref_1.jpg" \
+    --input_instruction "Replace the lamp in the first image with the dog in the second image" \
+    --output_path "./example_input/edit_tests/1/edit_res.jpg"
 ```
 
 Multimodal Instriction-based Generation

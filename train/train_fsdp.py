@@ -194,12 +194,10 @@ if accelerator.is_main_process:
 base_model = ARGS.base_model_path
 dit = FluxTransformer2DModel.from_pretrained(base_model, subfolder = "transformer", torch_dtype=weight_dtype)
 vae = AutoencoderKL.from_pretrained(base_model, subfolder="vae")
-t5 = T5EncoderModel.from_pretrained(base_model, subfolder="text_encoder_2")
-clip = CLIPTextModel.from_pretrained(base_model, subfolder="text_encoder")
+t5 = T5EncoderModel.from_pretrained(base_model, subfolder="text_encoder_2", torch_dtype=weight_dtype)
+clip = CLIPTextModel.from_pretrained(base_model, subfolder="text_encoder", torch_dtype=weight_dtype)
 t5_tokenizer = T5Tokenizer.from_pretrained(base_model, subfolder = "tokenizer_2")
 clip_tokenizer = CLIPTokenizer.from_pretrained(base_model, subfolder = "tokenizer")
-
-logger.info("****************finish loading models********************")
 
 vae.requires_grad_(False)
 t5.requires_grad_(False)
@@ -212,8 +210,6 @@ lora_config = LoraConfig(
     r=lora_rank, lora_alpha=lora_alpha, target_modules=["to_q", "to_v"], lora_dropout=0.05
 )
 dit.add_adapter(lora_config, adapter_name="edit")
-
-logger.info("****************finish adding lora********************")
 
 # 检查可训练参数
 trainable_params = [p for n, p in dit.named_parameters() if p.requires_grad]
@@ -232,7 +228,6 @@ num_channels_latents = dit.config.in_channels // 4
 dit, optimizer, dataloader = accelerator.prepare(
     dit, optimizer, dataloader
 )
-# dit.gradient_checkpointing = True
 generator = torch.Generator(device=device).manual_seed(42)
 
 # if accelerator.is_main_process:
@@ -279,7 +274,6 @@ for epoch in range(num_epochs):
                 ).to(device)
                 if ARGS.offload:
                     clip.to("cpu")
-                logger.info("***************finish clip****************")
 
                 t5.to(device)
                 prompt_embeds = _encode_prompt_with_t5(
@@ -291,7 +285,6 @@ for epoch in range(num_epochs):
                 text_ids = torch.zeros(prompt_embeds.shape[1], 3).to(device=device, dtype=t5.dtype)
                 if ARGS.offload:
                     t5.to("cpu")
-                logger.info("***************finish t5****************")
                 # image preprocess
                 # replace5k dataset has been preprocess during getitem
                 

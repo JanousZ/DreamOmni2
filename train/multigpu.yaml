@@ -1,0 +1,5 @@
+compute_environment: LOCAL_MACHINE
+num_processes: 3             
+num_machines: 1
+machine_rank: 0
+distributed_type: MULTI_GPU

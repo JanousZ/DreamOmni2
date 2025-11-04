@@ -26,7 +26,7 @@ from transformers import (
     CLIPTokenizer,
     CLIPVisionModelWithProjection,
     T5EncoderModel,
-    T5Tokenizer,
+    T5TokenizerFast,
     is_wandb_available
 )
 from tqdm import tqdm
@@ -66,14 +66,13 @@ def parse_args():
     parser.add_argument("--lora_alpha", type=float, default=32)
     parser.add_argument("--num_epochs", type=int, default=1000)
     parser.add_argument("--output_dir", type=str, default="./lora_ckpt")
-    parser.add_argument("--logging_dir", type=str, default="logs")
+    parser.add_argument("--logging_dir", type=str, default="./logs")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--mixed_precision", type=str, default="bf16")
     parser.add_argument("--max_train_steps", type=int, default=1000000)
     parser.add_argument("--report_to", type=str, default="wandb")
     parser.add_argument("--save_steps", type=int, default=500)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--offload", type=bool, default=True)
     args = parser.parse_args()
     return args
 
@@ -156,9 +155,9 @@ accelerator = Accelerator(
         mixed_precision=ARGS.mixed_precision,
         log_with=ARGS.report_to,
         project_config=accelerator_project_config,
+        
     )
-device = accelerator.device
-
+# device = accelerator.device
 weight_dtype = torch.float32
 if accelerator.mixed_precision == "fp16":
     weight_dtype = torch.float16
@@ -192,14 +191,12 @@ if accelerator.is_main_process:
 # processor = AutoProcessor.from_pretrained(ARGS.vlm_path)
 
 base_model = ARGS.base_model_path
-dit = FluxTransformer2DModel.from_pretrained(base_model, subfolder = "transformer", torch_dtype=weight_dtype)
+dit = FluxTransformer2DModel.from_pretrained(base_model, subfolder = "transformer")
 vae = AutoencoderKL.from_pretrained(base_model, subfolder="vae")
 t5 = T5EncoderModel.from_pretrained(base_model, subfolder="text_encoder_2")
 clip = CLIPTextModel.from_pretrained(base_model, subfolder="text_encoder")
-t5_tokenizer = T5Tokenizer.from_pretrained(base_model, subfolder = "tokenizer_2")
+t5_tokenizer = T5TokenizerFast.from_pretrained(base_model, subfolder = "tokenizer_2")
 clip_tokenizer = CLIPTokenizer.from_pretrained(base_model, subfolder = "tokenizer")
-
-logger.info("****************finish loading models********************")
 
 vae.requires_grad_(False)
 t5.requires_grad_(False)
@@ -212,12 +209,17 @@ lora_config = LoraConfig(
     r=lora_rank, lora_alpha=lora_alpha, target_modules=["to_q", "to_v"], lora_dropout=0.05
 )
 dit.add_adapter(lora_config, adapter_name="edit")
+dit.enable_gradient_checkpointing()
 
-logger.info("****************finish adding lora********************")
+torch.cuda.empty_cache()
+model = Composite_Model(
+    clip=clip, t5=t5, vae=vae, dit=dit, clip_tokenizer=clip_tokenizer, t5_tokenizer=t5_tokenizer
+)
+device = torch.device(f"cuda:{torch.cuda.current_device()}")
 
 # 检查可训练参数
-trainable_params = [p for n, p in dit.named_parameters() if p.requires_grad]
-trainable_named_params = [n for n, p in dit.named_parameters() if p.requires_grad]
+trainable_params = [p for n, p in model.dit.named_parameters() if p.requires_grad]
+trainable_named_params = [n for n, p in model.dit.named_parameters() if p.requires_grad]
 # logger.info(f"trainable_named_params: {trainable_named_params}")
 
 # 设置优化器
@@ -228,12 +230,21 @@ optimizer = AdamW(trainable_params, lr=lr)
 dataset = Replace5kDataset(json_file="/home/yanzhang/datasets/replace-5k/train.json")
 dataloader = DataLoader(dataset, batch_size=1, shuffle=True)
 
-num_channels_latents = dit.config.in_channels // 4
-dit, optimizer, dataloader = accelerator.prepare(
-    dit, optimizer, dataloader
+model = FSDP(
+    model,
+    auto_wrap_policy=no_wrap_embedding,
+    mixed_precision=MixedPrecision(
+        param_dtype=weight_dtype,
+        reduce_dtype=weight_dtype,
+        buffer_dtype=weight_dtype
+    ),
+    device_id=torch.cuda.current_device(),
+    use_orig_params=True
 )
-# dit.gradient_checkpointing = True
-generator = torch.Generator(device=device).manual_seed(42)
+optimizer, dataloader = accelerator.prepare(
+    optimizer, dataloader
+)
+generator = torch.Generator(device=torch.cuda.current_device()).manual_seed(42)
 
 # if accelerator.is_main_process:
 #     accelerator.init_trackers(args.tracker_project_name, {"test": None})    
@@ -270,38 +281,31 @@ for epoch in range(num_epochs):
                 prompts = instructions
             
                 # 获取文本embedding & tokens
-                clip.to(device)
                 pooled_prompt_embeds = _encode_prompt_with_clip(
-                    text_encoder=clip,
-                    tokenizer=clip_tokenizer,
+                    text_encoder=self.clip,
+                    tokenizer=self.clip_tokenizer,
                     prompt=prompts,
                     device=device if device is not None else clip.device,
                 ).to(device)
-                if ARGS.offload:
-                    clip.to("cpu")
                 logger.info("***************finish clip****************")
-
-                t5.to(device)
                 prompt_embeds = _encode_prompt_with_t5(
-                    text_encoder=t5,
-                    tokenizer=t5_tokenizer,
+                    text_encoder=self.t5,
+                    tokenizer=self.t5_tokenizer,
                     prompt=prompts,
                     device=device if device is not None else t5.device,
                 ).to(device)
-                text_ids = torch.zeros(prompt_embeds.shape[1], 3).to(device=device, dtype=t5.dtype)
-                if ARGS.offload:
-                    t5.to("cpu")
+                text_ids = torch.zeros(prompt_embeds.shape[1], 3).to(device=device, dtype=clip.dtype)
                 logger.info("***************finish t5****************")
                 # image preprocess
                 # replace5k dataset has been preprocess during getitem
                 
                 # image encode
-                vae.to(device)
                 height = 1024
                 width = 1024
-                src_image_latents = (vae.encode(src_images).latent_dist.sample() - vae.config.shift_factor) * vae.config.scaling_factor
-                ref_image_latents = (vae.encode(ref_images).latent_dist.sample() - vae.config.shift_factor) * vae.config.scaling_factor
-                tgt_image_latents = (vae.encode(tgt_images).latent_dist.sample() - vae.config.shift_factor) * vae.config.scaling_factor
+                num_channels_latents = self.dit.config.in_channels // 4
+                src_image_latents = (self.vae.encode(src_images).latent_dist.sample() - self.vae.config.shift_factor) * self.vae.config.scaling_factor
+                ref_image_latents = (self.vae.encode(ref_images).latent_dist.sample() - self.vae.config.shift_factor) * self.vae.config.scaling_factor
+                tgt_image_latents = (self.vae.encode(tgt_images).latent_dist.sample() - self.vae.config.shift_factor) * self.vae.config.scaling_factor
                 image_latent_height, image_latent_width = src_image_latents.shape[2:]
                 src_image_latents = _pack_latents(
                     src_image_latents, batch_size, num_channels_latents, image_latent_height, image_latent_width
@@ -327,8 +331,6 @@ for epoch in range(num_epochs):
                 w_offset += image_latent_width // 2
                 ref_image_ids[..., 0] += 2
                 ref_image_ids[..., 2] += w_offset
-                if ARGS.offload:
-                    vae.to("cpu")
                 
                 # timestep
                 t = torch.rand(batch_size, 1, 1, device=device) 
@@ -355,7 +357,10 @@ for epoch in range(num_epochs):
 
             # loss
             diff_loss = torch.nn.functional.mse_loss(noise_pred.float(), (x_1 - tgt_image_latents).float(), reduction="mean")
-            loss = diff_loss 
+            pred_x0 = x_t - t * noise_pred
+            lambda_dino = 0
+            dino_loss = 0
+            loss = diff_loss + lambda_dino * dino_loss
 
             accelerator.backward(loss)
             optimizer.step()
